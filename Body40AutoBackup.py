@@ -1,49 +1,53 @@
 # -*- coding: utf-8 -*-
 """
 Body40AutoBackup.py
-用途：
-1. 將本程式放在「明葦 硬碟」內。
-2. 雙擊啟動後，程式持續等待 BODY40 密錄器。
-3. 偵測到根目錄含 DPB40 的裝置後，自動備份到：
-   <備份硬碟>\◆◆◆密錄器備份◆◆\YYYY-MM-DD\
-4. 備份完成後顯示訊息，並繼續等待下一次插入。
 
-注意：
-- 不刪除密錄器原始檔。
-- 不依賴固定磁碟代號。
-- 僅使用 Windows 內建功能與 Python 標準函式庫。
-- 打包成 EXE 後可免安裝 Python 使用。
+功能：
+1. 程式放在備份硬碟內，雙擊後等待 BODY40 密錄器。
+2. 自動偵測根目錄含 DPB40 的密錄器。
+3. 只備份 DPB40\VIDEO 裡的影片，不備份照片及其他資料。
+4. 備份到：
+   <程式所在硬碟>\◆◆◆密錄器備份◆◆\YYYY-MM-DD\
+5. 日期資料夾點開後直接就是影片，不再多包一層 VIDEO。
+6. 顯示檔案數量、目前檔名及實際進度條。
+7. 不刪除密錄器原始檔。
 """
 
 from __future__ import annotations
 
 import ctypes
 import datetime as dt
-import json
 import os
 import shutil
 import string
-import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 from tkinter import Tk, Label, Button, StringVar, messagebox
+from tkinter.ttk import Progressbar
 
 APP_NAME = "Body40 自動備份"
 POLL_SECONDS = 2
-SOURCE_FOLDER_NAME = "DPB40"
+SOURCE_ROOT_FOLDER = "DPB40"
+VIDEO_FOLDER_NAME = "VIDEO"
+
 DESTINATION_FOLDER_CANDIDATES = (
     "◆◆◆密錄器備份◆◆",
     "♦♦♦密錄器備份♦♦",
     "密錄器備份",
 )
-LOG_FILE_NAME = "Body40Backup.log"
-STATE_FILE_NAME = "Body40Backup_state.json"
+
+VIDEO_EXTENSIONS = {
+    ".mp4", ".mov", ".avi", ".mkv", ".m4v",
+    ".wmv", ".mts", ".m2ts", ".ts", ".3gp",
+    ".mpg", ".mpeg", ".vob"
+}
+
+COPY_BUFFER_SIZE = 4 * 1024 * 1024
 
 
 def get_app_directory() -> Path:
-    """取得程式所在目錄；打包成 EXE 後也會指向 EXE 所在位置。"""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
@@ -55,6 +59,7 @@ APP_DIR = get_app_directory()
 def list_windows_drives() -> list[Path]:
     drives: list[Path] = []
     bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+
     for index, letter in enumerate(string.ascii_uppercase):
         if bitmask & (1 << index):
             root = Path(f"{letter}:\\")
@@ -63,62 +68,71 @@ def list_windows_drives() -> list[Path]:
                     drives.append(root)
             except OSError:
                 pass
+
     return drives
 
 
 def drive_type(root: Path) -> int:
-    # 2=Removable, 3=Fixed, 4=Network, 5=CDROM, 6=RAMDisk
     return ctypes.windll.kernel32.GetDriveTypeW(str(root))
 
 
-def volume_label(root: Path) -> str:
-    volume_name_buffer = ctypes.create_unicode_buffer(261)
-    fs_name_buffer = ctypes.create_unicode_buffer(261)
-    serial_number = ctypes.c_ulong()
-    max_component_length = ctypes.c_ulong()
-    file_system_flags = ctypes.c_ulong()
+def find_video_folder(root: Path) -> Path | None:
+    """
+    優先尋找 DPB40\VIDEO。
+    若大小寫不同，則用不分大小寫方式尋找。
+    """
+    dpb40 = root / SOURCE_ROOT_FOLDER
+    if not dpb40.is_dir():
+        return None
 
-    ok = ctypes.windll.kernel32.GetVolumeInformationW(
-        ctypes.c_wchar_p(str(root)),
-        volume_name_buffer,
-        ctypes.sizeof(volume_name_buffer),
-        ctypes.byref(serial_number),
-        ctypes.byref(max_component_length),
-        ctypes.byref(file_system_flags),
-        fs_name_buffer,
-        ctypes.sizeof(fs_name_buffer),
-    )
-    return volume_name_buffer.value if ok else ""
+    direct = dpb40 / VIDEO_FOLDER_NAME
+    if direct.is_dir():
+        return direct
+
+    try:
+        for child in dpb40.iterdir():
+            if child.is_dir() and child.name.casefold() == VIDEO_FOLDER_NAME.casefold():
+                return child
+    except (OSError, PermissionError):
+        return None
+
+    return None
 
 
-def find_source_drive() -> Path | None:
-    """來源判斷：磁碟根目錄存在 DPB40，且不是程式所在磁碟。"""
+def find_source_drive() -> tuple[Path, Path] | None:
+    """
+    找出含 DPB40\VIDEO 的密錄器。
+    排除程式所在磁碟，避免把備份硬碟誤認為來源。
+    """
     app_drive = APP_DIR.drive.upper()
-    candidates: list[Path] = []
+    candidates: list[tuple[Path, Path]] = []
 
     for root in list_windows_drives():
         try:
             if root.drive.upper() == app_drive:
                 continue
-            source_dir = root / SOURCE_FOLDER_NAME
-            if source_dir.is_dir():
-                candidates.append(root)
+
+            video_folder = find_video_folder(root)
+            if video_folder is not None:
+                candidates.append((root, video_folder))
         except (OSError, PermissionError):
             continue
 
     if not candidates:
         return None
 
-    # 優先可移除式磁碟，再依磁碟代號排序。
-    candidates.sort(key=lambda p: (0 if drive_type(p) == 2 else 1, str(p)))
+    candidates.sort(
+        key=lambda item: (
+            0 if drive_type(item[0]) == 2 else 1,
+            str(item[0])
+        )
+    )
     return candidates[0]
 
 
-def find_destination_root() -> tuple[Path, Path] | None:
+def find_destination_folder() -> Path | None:
     """
-    優先使用程式所在磁碟作為備份硬碟。
-    找出既有的「密錄器備份」資料夾；若不存在則建立標準名稱。
-    回傳：(備份硬碟根目錄, 備份主資料夾)
+    使用 EXE 所在磁碟作為備份硬碟。
     """
     root = Path(APP_DIR.drive + "\\")
     if not root.exists():
@@ -127,269 +141,343 @@ def find_destination_root() -> tuple[Path, Path] | None:
     for folder_name in DESTINATION_FOLDER_CANDIDATES:
         candidate = root / folder_name
         if candidate.is_dir():
-            return root, candidate
+            return candidate
 
     standard = root / DESTINATION_FOLDER_CANDIDATES[0]
     try:
         standard.mkdir(parents=True, exist_ok=True)
-        return root, standard
+        return standard
     except (OSError, PermissionError):
         return None
 
 
-def safe_log(message: str) -> None:
-    timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{timestamp}] {message}\n"
+def collect_video_files(video_folder: Path) -> list[Path]:
+    files: list[Path] = []
+
     try:
-        with (APP_DIR / LOG_FILE_NAME).open("a", encoding="utf-8") as f:
-            f.write(line)
+        for item in video_folder.rglob("*"):
+            if item.is_file() and item.suffix.casefold() in VIDEO_EXTENSIONS:
+                files.append(item)
+    except (OSError, PermissionError):
+        pass
+
+    files.sort(key=lambda p: (p.stat().st_mtime if p.exists() else 0, p.name.casefold()))
+    return files
+
+
+def get_unique_destination(target_folder: Path, source_file: Path) -> Path:
+    """
+    日期資料夾內直接放影片。
+    遇到同名檔案時自動加上 _2、_3，避免覆蓋。
+    """
+    candidate = target_folder / source_file.name
+
+    if not candidate.exists():
+        return candidate
+
+    try:
+        if (
+            candidate.stat().st_size == source_file.stat().st_size
+            and int(candidate.stat().st_mtime) == int(source_file.stat().st_mtime)
+        ):
+            return candidate
     except OSError:
         pass
 
+    stem = source_file.stem
+    suffix = source_file.suffix
+    index = 2
 
-def load_state() -> dict:
-    path = APP_DIR / STATE_FILE_NAME
+    while True:
+        candidate = target_folder / f"{stem}_{index}{suffix}"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def copy_file_with_progress(
+    source: Path,
+    destination: Path,
+    on_chunk
+) -> bool:
+    """
+    回傳 True 表示有實際複製，False 表示檔案已存在且相同。
+    """
+    if destination.exists():
+        try:
+            if (
+                destination.stat().st_size == source.stat().st_size
+                and int(destination.stat().st_mtime) == int(source.stat().st_mtime)
+            ):
+                on_chunk(source.stat().st_size)
+                return False
+        except OSError:
+            pass
+
+    temp_destination = destination.with_suffix(destination.suffix + ".part")
+
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        if temp_destination.exists():
+            temp_destination.unlink()
+    except OSError:
+        pass
+
+    try:
+        with source.open("rb") as src, temp_destination.open("wb") as dst:
+            while True:
+                chunk = src.read(COPY_BUFFER_SIZE)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                on_chunk(len(chunk))
+
+        shutil.copystat(source, temp_destination)
+        temp_destination.replace(destination)
+        return True
+
     except Exception:
-        return {}
-
-
-def save_state(state: dict) -> None:
-    path = APP_DIR / STATE_FILE_NAME
-    try:
-        path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError:
-        pass
-
-
-def source_signature(source_root: Path) -> str:
-    """
-    使用磁碟代號、卷標及 DPB40 最後修改時間建立簡易識別。
-    可避免同一次插入被重複啟動備份。
-    """
-    try:
-        modified = int((source_root / SOURCE_FOLDER_NAME).stat().st_mtime)
-    except OSError:
-        modified = 0
-    return f"{source_root.drive}|{volume_label(source_root)}|{modified}"
-
-
-def unique_target_folder(base_folder: Path) -> Path:
-    today = dt.datetime.now().strftime("%Y-%m-%d")
-    target = base_folder / today
-    target.mkdir(parents=True, exist_ok=True)
-    return target
-
-
-def robocopy_backup(source: Path, target: Path) -> tuple[bool, str]:
-    """
-    使用 Windows 內建 robocopy。
-    回傳碼 0~7 均代表成功或有可接受差異；8 以上才視為失敗。
-    """
-    cmd = [
-        "robocopy",
-        str(source),
-        str(target),
-        "/E",          # 包含子資料夾
-        "/COPY:DAT",   # 資料、屬性、時間
-        "/DCOPY:DAT",
-        "/R:2",        # 失敗重試 2 次
-        "/W:2",        # 每次等 2 秒
-        "/XJ",         # 排除 junction
-        "/FFT",        # 相容 FAT/exFAT 時間精度
-        "/NP",
-        "/NFL",
-        "/NDL",
-    ]
-
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        errors="replace",
-        creationflags=creationflags,
-    )
-    success = result.returncode <= 7
-    detail = (result.stdout or result.stderr or "").strip()
-    return success, detail
-
-
-def shutil_backup(source: Path, target: Path) -> tuple[bool, str]:
-    """robocopy 無法使用時的備援方案。"""
-    copied = 0
-    skipped = 0
-    try:
-        for item in source.rglob("*"):
-            relative = item.relative_to(source)
-            destination = target / relative
-
-            if item.is_dir():
-                destination.mkdir(parents=True, exist_ok=True)
-                continue
-
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if destination.exists():
-                try:
-                    if (
-                        destination.stat().st_size == item.stat().st_size
-                        and int(destination.stat().st_mtime) >= int(item.stat().st_mtime)
-                    ):
-                        skipped += 1
-                        continue
-                except OSError:
-                    pass
-
-            shutil.copy2(item, destination)
-            copied += 1
-
-        return True, f"複製 {copied} 個檔案，略過 {skipped} 個既有檔案。"
-    except Exception as exc:
-        return False, str(exc)
+        try:
+            if temp_destination.exists():
+                temp_destination.unlink()
+        except OSError:
+            pass
+        raise
 
 
 class BackupApp:
     def __init__(self) -> None:
         self.root = Tk()
         self.root.title(APP_NAME)
-        self.root.geometry("470x210")
+        self.root.geometry("540x300")
         self.root.resizable(False, False)
 
-        self.status = StringVar(value="正在啟動…")
-        self.detail = StringVar(value="請先插入備份硬碟，再啟動本程式。")
+        self.status_text = StringVar(value="正在啟動…")
+        self.detail_text = StringVar(value="")
+        self.file_text = StringVar(value="")
+        self.progress_text = StringVar(value="0%")
 
-        Label(self.root, text=APP_NAME, font=("Microsoft JhengHei UI", 18, "bold")).pack(pady=(20, 8))
-        Label(self.root, textvariable=self.status, font=("Microsoft JhengHei UI", 12)).pack(pady=6)
         Label(
             self.root,
-            textvariable=self.detail,
+            text=APP_NAME,
+            font=("Microsoft JhengHei UI", 20, "bold")
+        ).pack(pady=(22, 10))
+
+        Label(
+            self.root,
+            textvariable=self.status_text,
+            font=("Microsoft JhengHei UI", 13)
+        ).pack(pady=4)
+
+        Label(
+            self.root,
+            textvariable=self.detail_text,
             font=("Microsoft JhengHei UI", 10),
-            wraplength=430,
-            justify="center",
-        ).pack(pady=6)
+            wraplength=500,
+            justify="center"
+        ).pack(pady=4)
+
+        Label(
+            self.root,
+            textvariable=self.file_text,
+            font=("Microsoft JhengHei UI", 10),
+            wraplength=500,
+            justify="center"
+        ).pack(pady=(8, 4))
+
+        self.progress = Progressbar(
+            self.root,
+            orient="horizontal",
+            mode="determinate",
+            length=440,
+            maximum=100
+        )
+        self.progress.pack(pady=(8, 3))
+
+        Label(
+            self.root,
+            textvariable=self.progress_text,
+            font=("Microsoft JhengHei UI", 10)
+        ).pack()
 
         Button(
             self.root,
             text="結束",
             width=12,
             command=self.close,
-            font=("Microsoft JhengHei UI", 10),
-        ).pack(pady=10)
+            font=("Microsoft JhengHei UI", 10)
+        ).pack(pady=14)
 
         self.running = True
         self.backing_up = False
-        self.last_seen_signature: str | None = None
+        self.current_source_drive: str | None = None
+
         self.worker = threading.Thread(target=self.monitor_loop, daemon=True)
         self.worker.start()
 
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
-    def set_status(self, status: str, detail: str = "") -> None:
-        self.root.after(0, lambda: self.status.set(status))
-        self.root.after(0, lambda: self.detail.set(detail))
+    def ui(self, callback) -> None:
+        self.root.after(0, callback)
+
+    def set_status(self, status: str, detail: str = "", filename: str = "") -> None:
+        self.ui(lambda: self.status_text.set(status))
+        self.ui(lambda: self.detail_text.set(detail))
+        self.ui(lambda: self.file_text.set(filename))
+
+    def set_progress(self, percent: float) -> None:
+        value = max(0.0, min(100.0, percent))
+        self.ui(lambda: self.progress.configure(value=value))
+        self.ui(lambda: self.progress_text.set(f"{value:.1f}%"))
 
     def notify(self, title: str, text: str, error: bool = False) -> None:
-        def _show() -> None:
+        def show() -> None:
             if error:
                 messagebox.showerror(title, text)
             else:
                 messagebox.showinfo(title, text)
-        self.root.after(0, _show)
 
-    def monitor_loop(self) -> None:
-        safe_log("程式啟動。")
-        destination = find_destination_root()
+        self.ui(show)
 
-        if destination is None:
+    def backup_videos(self, video_folder: Path, destination_root: Path) -> None:
+        today = dt.datetime.now().strftime("%Y-%m-%d")
+        target_folder = destination_root / today
+        target_folder.mkdir(parents=True, exist_ok=True)
+
+        video_files = collect_video_files(video_folder)
+
+        if not video_files:
             self.set_status(
-                "找不到備份硬碟",
-                "請將本程式放在「明葦 硬碟」內，再重新啟動。",
+                "找不到影片",
+                f"已找到密錄器，但 {video_folder} 內沒有可備份的影片。"
             )
-            safe_log("無法取得備份硬碟。")
+            self.set_progress(0)
+            self.notify(APP_NAME, "VIDEO 資料夾內沒有找到影片。", error=True)
             return
 
-        destination_drive, destination_folder = destination
+        total_bytes = sum(file.stat().st_size for file in video_files)
+        copied_bytes = 0
+        copied_count = 0
+        skipped_count = 0
+
+        self.set_progress(0)
+
+        def on_chunk(size: int) -> None:
+            nonlocal copied_bytes
+            copied_bytes += size
+            percent = (copied_bytes / total_bytes * 100) if total_bytes else 100
+            self.set_progress(percent)
+
+        for index, source_file in enumerate(video_files, start=1):
+            if not self.running:
+                return
+
+            self.set_status(
+                "正在備份影片",
+                f"第 {index}／{len(video_files)} 個",
+                source_file.name
+            )
+
+            destination_file = get_unique_destination(target_folder, source_file)
+            copied = copy_file_with_progress(
+                source_file,
+                destination_file,
+                on_chunk
+            )
+
+            if copied:
+                copied_count += 1
+            else:
+                skipped_count += 1
+
+        self.set_progress(100)
         self.set_status(
-            "等待 BODY40 密錄器",
-            f"備份位置：{destination_folder}",
+            "備份完成",
+            f"已複製 {copied_count} 個影片，略過 {skipped_count} 個相同檔案。",
+            f"位置：{target_folder}"
         )
 
-        while self.running:
-            source_drive = find_source_drive()
+        self.notify(
+            APP_NAME,
+            f"備份完成。\n\n"
+            f"影片：{copied_count} 個\n"
+            f"略過：{skipped_count} 個\n\n"
+            f"位置：\n{target_folder}"
+        )
 
-            if source_drive is None:
-                self.last_seen_signature = None
+        try:
+            os.startfile(target_folder)
+        except OSError:
+            pass
+
+    def monitor_loop(self) -> None:
+        destination_root = find_destination_folder()
+
+        if destination_root is None:
+            self.set_status(
+                "找不到備份硬碟",
+                "請把 Body40AutoBackup.exe 放在「明葦 硬碟」內，再重新啟動。"
+            )
+            return
+
+        self.set_status(
+            "等待 BODY40 密錄器",
+            f"只會備份 DPB40\\VIDEO 內的影片。\n備份位置：{destination_root}"
+        )
+        self.set_progress(0)
+
+        while self.running:
+            source = find_source_drive()
+
+            if source is None:
+                self.current_source_drive = None
                 if not self.backing_up:
                     self.set_status(
                         "等待 BODY40 密錄器",
-                        f"備份位置：{destination_folder}",
+                        f"只會備份 DPB40\\VIDEO 內的影片。\n備份位置：{destination_root}"
                     )
+                    self.set_progress(0)
                 time.sleep(POLL_SECONDS)
                 continue
 
-            signature = source_signature(source_drive)
-            if signature == self.last_seen_signature or self.backing_up:
+            source_drive, video_folder = source
+            source_key = str(source_drive)
+
+            if self.backing_up or self.current_source_drive == source_key:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            self.last_seen_signature = signature
+            self.current_source_drive = source_key
             self.backing_up = True
 
-            source_folder = source_drive / SOURCE_FOLDER_NAME
-            target_folder = unique_target_folder(destination_folder)
-
-            self.set_status(
-                "偵測到密錄器，開始備份",
-                f"{source_folder}  →  {target_folder}",
-            )
-            safe_log(f"開始備份：{source_folder} -> {target_folder}")
-
             try:
-                success, detail = robocopy_backup(source_folder, target_folder)
-            except FileNotFoundError:
-                success, detail = shutil_backup(source_folder, target_folder)
+                self.backup_videos(video_folder, destination_root)
             except Exception as exc:
-                success, detail = False, str(exc)
-
-            if success:
-                safe_log(f"備份完成。{detail}")
-                self.set_status(
-                    "備份完成",
-                    f"已備份到：{target_folder}\n可拔除密錄器，程式會繼續等待下一次。",
-                )
-                self.notify(
-                    APP_NAME,
-                    f"備份完成。\n\n位置：\n{target_folder}",
-                )
-                try:
-                    os.startfile(target_folder)
-                except OSError:
-                    pass
-            else:
-                safe_log(f"備份失敗：{detail}")
                 self.set_status(
                     "備份失敗",
                     "請確認硬碟空間、裝置連線及檔案權限。",
+                    str(exc)
                 )
-                self.notify(
-                    APP_NAME,
-                    f"備份失敗：\n{detail}",
-                    error=True,
-                )
+                self.notify(APP_NAME, f"備份失敗：\n{exc}", error=True)
+            finally:
+                self.backing_up = False
 
-            self.backing_up = False
+            self.set_status(
+                "請拔除密錄器",
+                "拔除後可再次插入並進行下一次備份。"
+            )
 
-            # 等待密錄器拔除後才允許下一次備份，
-            # 避免裝置仍插著時重複執行。
             while self.running and find_source_drive() is not None:
                 time.sleep(POLL_SECONDS)
 
-            self.last_seen_signature = None
+            self.current_source_drive = None
+            self.set_status(
+                "等待 BODY40 密錄器",
+                f"只會備份 DPB40\\VIDEO 內的影片。\n備份位置：{destination_root}"
+            )
+            self.set_progress(0)
 
     def close(self) -> None:
         self.running = False
-        safe_log("程式結束。")
         self.root.destroy()
 
     def run(self) -> None:
@@ -401,8 +489,7 @@ def main() -> None:
         print("本程式僅支援 Windows。")
         return
 
-    app = BackupApp()
-    app.run()
+    BackupApp().run()
 
 
 if __name__ == "__main__":
