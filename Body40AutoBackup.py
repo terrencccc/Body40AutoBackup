@@ -31,8 +31,8 @@ from tkinter import Tk, Label, Button, StringVar, messagebox
 from tkinter.ttk import Progressbar
 
 APP_NAME = "BODY40 自動備份"
-VERSION = "v2.1.0"
-BUILD_DATE = "2026-08-02"
+VERSION = "v4.0.0"
+BUILD_DATE = "2026-08-02 FINAL"
 
 SOURCE_VOLUME_LABEL = "明葦 密錄器"
 DESTINATION_VOLUME_LABEL = "明葦 硬碟"
@@ -209,36 +209,24 @@ def collect_video_files(video_folder: Path) -> list[Path]:
 
 def parse_video_date(source_file: Path) -> dt.date | None:
     """
-    僅依檔名日期解析，不使用今天日期。
-
-    支援：
-    2026_0615_103948_580.mp4
-    20260615_103948580.mp4
-    2026-06-15_103948.mp4
-    _2024_1022_063217_001.mp4
+    FINAL v4.0：
+    日期只取檔名，不讀任何檔案時間。
     """
-    name = source_file.stem
+    name = source_file.name
 
-    patterns = (
-        r"(?<!\d)(20\d{2})[_-](\d{2})(\d{2})(?!\d)",
-        r"(?<!\d)(20\d{2})[_-](\d{2})[_-](\d{2})(?!\d)",
-        r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)",
-    )
+    m = re.match(r'^(\d{4})_(\d{2})(\d{2})_', name)
+    if not m:
+        m = re.match(r'^(\d{4})(\d{2})(\d{2})_', name)
+    if not m:
+        m = re.match(r'^(\d{4})-(\d{2})-(\d{2})_', name)
 
-    for pattern in patterns:
-        match = re.search(pattern, name)
-        if not match:
-            continue
+    if not m:
+        return None
 
-        year, month, day = map(int, match.groups())
-
-        try:
-            return dt.date(year, month, day)
-        except ValueError:
-            continue
-
-    return None
-
+    try:
+        return dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
 
 def to_roc_folder_name(date_value: dt.date) -> str:
     roc_year = date_value.year - 1911
